@@ -1,0 +1,60 @@
+# Vikunja + MCP bridge — one stack.
+# Deploy in Portainer via Build method: Repository.
+
+services:
+  vikunja-init:
+    image: alpine:3.20
+    command: sh -c "chown -R 1000:0 /db /files && chmod -R g+rwX /db /files"
+    volumes:
+      - vikunja_db:/db
+      - vikunja_files:/files
+    restart: "no"
+
+  vikunja:
+    image: vikunja/vikunja:2.6.0
+    restart: unless-stopped
+    depends_on:
+      vikunja-init:
+        condition: service_completed_successfully
+    environment:
+      VIKUNJA_SERVICE_PUBLICURL: "https://${VIKUNJA_DOMAIN}/"
+      VIKUNJA_SERVICE_SECRET: "${VIKUNJA_JWT_SECRET}"
+      VIKUNJA_DATABASE_TYPE: "sqlite"
+      VIKUNJA_DATABASE_PATH: "/db/vikunja.db"
+      VIKUNJA_FILES_BASEPATH: "/files"
+      VIKUNJA_SERVICE_ENABLEREGISTRATION: "false"
+      VIKUNJA_SERVICE_TIMEZONE: "${TZ}"
+    volumes:
+      - vikunja_db:/db
+      - vikunja_files:/files
+    ports:
+      - "${VIKUNJA_PORT}:3456"
+    networks:
+      - vikunja
+
+  vikunja-mcp:
+    build: ./mcp
+    restart: unless-stopped
+    depends_on:
+      vikunja:
+        condition: service_started
+    environment:
+      VIKUNJA_URL: "http://vikunja:3456"
+      VIKUNJA_TOKEN: "${VIKUNJA_API_TOKEN}"
+      MCP_AUTH_TOKEN: "${MCP_AUTH_TOKEN}"
+      MCP_PORT: "8790"
+      MCP_BLOCK_DONE: "true"
+      MCP_DONE_BUCKET_TITLE: "Done"
+    ports:
+      - "${MCP_PORT_HOST}:8790"
+    networks:
+      - vikunja
+
+volumes:
+  vikunja_db:
+  vikunja_files:
+
+networks:
+  vikunja:
+    driver: bridge
+    name: vikunja
