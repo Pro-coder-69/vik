@@ -120,6 +120,26 @@ function slimTask(t, { descriptionChars = 0 } = {}) {
   };
 }
 
+// Acknowledgement for a WRITE. Deliberately omits the description: the caller
+// just sent it, so echoing it back doubles the token cost of every create and
+// update for no information. (Measured on the Linear import: a 9KB spec cost
+// ~9,800 tokens per ticket, of which ~4,800 was the body being read back.)
+// bucket_id is omitted too — it is always 0 on a task; use list_bucket_tasks.
+function writeAck(t) {
+  if (!t || typeof t !== "object") return t;
+  return {
+    id: t.id,
+    identifier: t.identifier,
+    title: t.title,
+    done: t.done,
+    priority: t.priority,
+    project_id: t.project_id,
+    due_date: t.due_date && !String(t.due_date).startsWith("0001") ? t.due_date : null,
+    updated: t.updated,
+    description_chars: strip(t.description).length,
+  };
+}
+
 async function kanbanView(projectId) {
   const raw = await vk(EP.views(projectId));
   const list = Array.isArray(raw) ? raw : (raw?.views ?? []);
@@ -237,7 +257,7 @@ const TOOLS = [
   },
   {
     name: "create_task",
-    description: "Create a task in a project. `description` is markdown by default and is converted to HTML, which is what Vikunja renders.",
+    description: "Create a task in a project. `description` is markdown by default and is converted to HTML, which is what Vikunja renders. Pass `done: true` to create an already-completed task (importing history) — no follow-up update_task needed. The response deliberately does NOT echo the description back.",
     inputSchema: {
       type: "object",
       properties: {
@@ -245,21 +265,30 @@ const TOOLS = [
         title: { type: "string" },
         description: { type: "string", description: "Markdown (default) or HTML — see description_format" },
         description_format: { type: "string", enum: ["markdown", "html"], description: "Default markdown" },
+        done: { type: "boolean", description: "Create the task already completed. Vikunja files it into the Done bucket itself." },
         due_date: { type: "string", description: "ISO timestamp" },
         priority: { type: "number", description: "0-5" },
       },
       required: ["project_id", "title"],
       additionalProperties: false,
     },
-    run: async ({ project_id, title, description, description_format, due_date, priority }) =>
-      slimTask(await vk(EP.createTask(project_id), {
+    run: async ({ project_id, title, description, description_format, done, due_date, priority }) => {
+      let task = await vk(EP.createTask(project_id), {
         method: "PUT",
-        body: { title, description: mdToHtml(description, description_format), due_date, priority },
-      })),
+        body: { title, description: mdToHtml(description, description_format), done, due_date, priority },
+      });
+      // Vikunja's create endpoint has not been confirmed to honour `done` on
+      // insert. Rather than trust it, check and post the flag separately if it
+      // did not stick — still one round trip for the caller either way.
+      if (done === true && task && task.done !== true) {
+        task = await vk(EP.task(task.id), { method: "POST", body: { ...task, done: true } });
+      }
+      return writeAck(task);
+    },
   },
   {
     name: "update_task",
-    description: "Update an existing task. Only the fields you pass are changed. `description` is markdown by default.",
+    description: "Update an existing task. Only the fields you pass are changed. `description` is markdown by default and REPLACES the whole body — use edit_description for a small change. The response deliberately does NOT echo the description back; read it with get_task or get_description if you need it.",
     inputSchema: {
       type: "object",
       properties: {
@@ -284,7 +313,7 @@ const TOOLS = [
       if (done !== undefined) body.done = done;
       if (due_date !== undefined) body.due_date = due_date;
       if (priority !== undefined) body.priority = priority;
-      return slimTask(await vk(EP.task(task_id), { method: "POST", body }));
+      return writeAck(await vk(EP.task(task_id), { method: "POST", body }));
     },
   },
   {
