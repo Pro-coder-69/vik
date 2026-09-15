@@ -56,6 +56,9 @@ const EP = {
   comments: (tid) => `/api/v1/tasks/${tid}/comments`,
   views: (pid) => `/api/v1/projects/${pid}/views`,
   buckets: (pid, vid) => `/api/v1/projects/${pid}/views/${vid}/buckets`,
+  // Returns the buckets WITH their tasks. The plain task endpoints omit
+  // bucket_id entirely, so this is the only way to read board position.
+  viewTasks: (pid, vid) => `/api/v1/projects/${pid}/views/${vid}/tasks`,
   bucketTasks: (pid, vid, bid) => `/api/v1/projects/${pid}/views/${vid}/buckets/${bid}/tasks`,
 };
 
@@ -372,6 +375,43 @@ const TOOLS = [
       const view = await kanbanView(project_id);
       const buckets = await vk(EP.buckets(project_id, view.id));
       return { view_id: view.id, buckets: (buckets ?? []).map((b) => ({ id: b.id, title: b.title })) };
+    },
+  },
+  {
+    name: "list_bucket_tasks",
+    description: "Read the kanban board: every column with the tasks currently in it. This is the ONLY way to see which column a task is in — get_task and list_tasks always report bucket_id as 0. Use it to answer \"what's in review\", or to confirm a move_task actually landed.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: { type: "number" },
+        bucket: { type: ["string", "number"], description: "Optional: only this column, by title or id" },
+      },
+      required: ["project_id"],
+      additionalProperties: false,
+    },
+    run: async ({ project_id, bucket }) => {
+      const view = await kanbanView(project_id);
+      const raw = (await vk(EP.viewTasks(project_id, view.id))) ?? [];
+      const wanted = bucket === undefined ? null : String(bucket).toLowerCase();
+      const columns = raw
+        .filter((b) => wanted === null || String(b.id) === wanted || (b.title ?? "").toLowerCase() === wanted)
+        .map((b) => {
+          const tasks = (b.tasks ?? []).map((t) => ({
+            id: t.id, identifier: t.identifier, title: t.title, done: t.done, priority: t.priority,
+          }));
+          // count is the column's true total; Vikunja pages tasks per bucket, so
+          // surface the gap rather than letting a partial list look complete.
+          const out = { bucket: b.title, bucket_id: b.id, count: b.count, tasks };
+          if (typeof b.count === "number" && b.count > tasks.length) {
+            out.tasks_truncated = true;
+            out.note = `Showing ${tasks.length} of ${b.count}; open the board in the web UI for the rest.`;
+          }
+          return out;
+        });
+      if (wanted !== null && columns.length === 0) {
+        throw new Error(`No bucket "${bucket}" on project ${project_id}. Try list_buckets.`);
+      }
+      return { project_id, view_id: view.id, columns };
     },
   },
   {
