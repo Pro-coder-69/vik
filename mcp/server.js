@@ -7,6 +7,29 @@
  */
 
 import http from "node:http";
+import { marked } from "marked";
+
+/* ------------------------- markdown -> HTML ------------------------- */
+// Vikunja stores task descriptions as HTML (TipTap). Linear stores markdown.
+// Passing markdown straight through renders literal "## " and "**bold**",
+// so everything inbound is converted unless the caller says it is already HTML.
+// No renderer overrides: marked's own output is standard HTML and TipTap
+// normalises it on parse. An earlier custom listitem renderer flattened
+// nested lists by re-parsing raw text instead of the token's children.
+marked.use({ gfm: true, breaks: false });
+
+function mdToHtml(src, format) {
+  const text = String(src ?? "");
+  if (!text) return "";
+  if (format === "html") return text;
+  try {
+    return marked.parse(text, { async: false });
+  } catch (e) {
+    // Never lose the content to a parser error — fall back to escaped text.
+    const esc = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    return `<pre><code>${esc}</code></pre>`;
+  }
+}
 
 const VIKUNJA_URL = (process.env.VIKUNJA_URL ?? "http://vikunja:3456").replace(/\/$/, "");
 const VIKUNJA_TOKEN = process.env.VIKUNJA_TOKEN ?? "";
@@ -26,8 +49,10 @@ for (const [k, v] of [["VIKUNJA_TOKEN", VIKUNJA_TOKEN], ["MCP_AUTH_TOKEN", MCP_A
 const EP = {
   projects: () => `/api/v1/projects`,
   projectTasks: (id) => `/api/v1/projects/${id}/tasks`,
-  createTask: (pid) => `/api/v1/projects/${pid}`,
+  // 2.6 moved creation onto /tasks; PUT on the bare project now 405s.
+  createTask: (pid) => `/api/v1/projects/${pid}/tasks`,
   task: (id) => `/api/v1/tasks/${id}`,
+  attachments: (tid) => `/api/v1/tasks/${tid}/attachments`,
   comments: (tid) => `/api/v1/tasks/${tid}/comments`,
   views: (pid) => `/api/v1/projects/${pid}/views`,
   buckets: (pid, vid) => `/api/v1/projects/${pid}/views/${vid}/buckets`,
@@ -50,6 +75,21 @@ async function vk(path, { method = "GET", body, query } = {}) {
     const msg = data && typeof data === "object" && data.message ? data.message : String(text).slice(0, 300);
     throw new Error(`Vikunja ${method} ${path} -> ${res.status}: ${msg}`);
   }
+  return data;
+}
+
+// Attachments are multipart, so they can't go through vk()'s JSON path.
+async function vkUpload(path, { filename, buffer, mimeType }) {
+  const fd = new FormData();
+  fd.append("files", new Blob([buffer], { type: mimeType || "application/octet-stream" }), filename);
+  const res = await fetch(VIKUNJA_URL + path, {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${VIKUNJA_TOKEN}` }, // no Content-Type: fetch sets the boundary
+    body: fd,
+  });
+  const text = await res.text();
+  let data; try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+  if (!res.ok) throw new Error(`Vikunja PUT ${path} -> ${res.status}: ${String(text).slice(0, 300)}`);
   return data;
 }
 
@@ -142,22 +182,90 @@ const TOOLS = [
   },
   {
     name: "create_task",
-    description: "Create a task in a project.",
+    description: "Create a task in a project. `description` is markdown by default and is converted to HTML, which is what Vikunja renders.",
     inputSchema: {
       type: "object",
       properties: {
         project_id: { type: "number" },
         title: { type: "string" },
-        description: { type: "string" },
+        description: { type: "string", description: "Markdown (default) or HTML — see description_format" },
+        description_format: { type: "string", enum: ["markdown", "html"], description: "Default markdown" },
         due_date: { type: "string", description: "ISO timestamp" },
         priority: { type: "number", description: "0-5" },
       },
       required: ["project_id", "title"],
       additionalProperties: false,
     },
-    // Creation is PUT on the project, not POST on /tasks.
-    run: async ({ project_id, title, description, due_date, priority }) =>
-      slimTask(await vk(EP.createTask(project_id), { method: "PUT", body: { title, description, due_date, priority } })),
+    run: async ({ project_id, title, description, description_format, due_date, priority }) =>
+      slimTask(await vk(EP.createTask(project_id), {
+        method: "PUT",
+        body: { title, description: mdToHtml(description, description_format), due_date, priority },
+      })),
+  },
+  {
+    name: "update_task",
+    description: "Update an existing task. Only the fields you pass are changed. `description` is markdown by default.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        task_id: { type: "number" },
+        title: { type: "string" },
+        description: { type: "string" },
+        description_format: { type: "string", enum: ["markdown", "html"], description: "Default markdown" },
+        done: { type: "boolean" },
+        due_date: { type: "string", description: "ISO timestamp" },
+        priority: { type: "number", description: "0-5" },
+      },
+      required: ["task_id"],
+      additionalProperties: false,
+    },
+    // Update is POST on the task, and Vikunja replaces the whole object —
+    // so merge onto what is already there instead of blanking the rest.
+    run: async ({ task_id, title, description, description_format, done, due_date, priority }) => {
+      const current = await vk(EP.task(task_id));
+      const body = { ...current };
+      if (title !== undefined) body.title = title;
+      if (description !== undefined) body.description = mdToHtml(description, description_format);
+      if (done !== undefined) body.done = done;
+      if (due_date !== undefined) body.due_date = due_date;
+      if (priority !== undefined) body.priority = priority;
+      return slimTask(await vk(EP.task(task_id), { method: "POST", body }));
+    },
+  },
+  {
+    name: "add_attachment",
+    description: "Attach a file (image, PDF, log) to a task. Content is base64. Max ~15MB.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        task_id: { type: "number" },
+        filename: { type: "string", description: "e.g. screenshot.png" },
+        content_base64: { type: "string", description: "Base64 of the file bytes, no data: prefix" },
+        mime_type: { type: "string", description: "e.g. image/png" },
+      },
+      required: ["task_id", "filename", "content_base64"],
+      additionalProperties: false,
+    },
+    run: async ({ task_id, filename, content_base64, mime_type }) => {
+      const buffer = Buffer.from(content_base64, "base64");
+      if (!buffer.length) throw new Error("content_base64 decoded to zero bytes");
+      if (buffer.length > 15 * 1024 * 1024) throw new Error(`${filename} is ${(buffer.length/1048576).toFixed(1)}MB — over the 15MB limit`);
+      const out = await vkUpload(EP.attachments(task_id), { filename, buffer, mimeType: mime_type });
+      return { task_id, filename, bytes: buffer.length, result: out };
+    },
+  },
+  {
+    name: "list_attachments",
+    description: "List files attached to a task.",
+    inputSchema: {
+      type: "object",
+      properties: { task_id: { type: "number" } },
+      required: ["task_id"],
+      additionalProperties: false,
+    },
+    run: async ({ task_id }) => ((await vk(EP.attachments(task_id))) ?? []).map((a) => ({
+      id: a.id, file: a.file?.name, size: a.file?.size, created: a.created,
+    })),
   },
   {
     name: "list_buckets",
@@ -262,7 +370,7 @@ async function handleRpc(msg) {
       return rpcResult(id, {
         protocolVersion: params?.protocolVersion ?? "2025-06-18",
         capabilities: { tools: {} },
-        serverInfo: { name: "vikunja-mcp", version: "1.0.0" },
+        serverInfo: { name: "vikunja-mcp", version: "1.1.0" },
       });
     case "ping":
       return rpcResult(id, {});
