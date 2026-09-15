@@ -255,6 +255,46 @@ const TOOLS = [
     },
   },
   {
+    name: "attach_from_url",
+    description: "Download a file from a URL and attach it to a task. For migrating images out of another tracker: the server fetches the bytes itself, so they never pass through the conversation. Signed URLs (e.g. Linear's uploads.linear.app links) work as-is and usually expire in minutes — call this promptly after fetching the link.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        task_id: { type: "number" },
+        url: { type: "string", description: "http(s) URL of the file" },
+        filename: { type: "string", description: "Override the name; defaults to the URL's last path segment" },
+        mime_type: { type: "string", description: "Override; defaults to the response Content-Type" },
+      },
+      required: ["task_id", "url"],
+      additionalProperties: false,
+    },
+    run: async ({ task_id, url, filename, mime_type }) => {
+      let u;
+      try { u = new URL(url); } catch { throw new Error(`Not a valid URL: ${url}`); }
+      if (u.protocol !== "https:" && u.protocol !== "http:") throw new Error(`Refusing protocol ${u.protocol}`);
+      // This tool fetches arbitrary URLs from inside the private network, so
+      // keep it pointed outward: no loopback, link-local or RFC1918 targets.
+      const host = u.hostname.toLowerCase();
+      const blocked =
+        host === "localhost" || host.endsWith(".localhost") || host === "vikunja" ||
+        /^(127\.|0\.|10\.|169\.254\.|192\.168\.)/.test(host) ||
+        /^172\.(1[6-9]|2\d|3[01])\./.test(host) ||
+        host === "::1" || host === "[::1]";
+      if (blocked) throw new Error(`Refusing to fetch a private/loopback address: ${host}`);
+
+      const res = await fetch(u, { redirect: "follow" });
+      if (!res.ok) throw new Error(`GET ${host}${u.pathname} -> ${res.status} ${res.statusText} (a signed URL may have expired)`);
+      const buffer = Buffer.from(await res.arrayBuffer());
+      if (!buffer.length) throw new Error("Downloaded zero bytes");
+      if (buffer.length > 15 * 1024 * 1024) throw new Error(`${(buffer.length/1048576).toFixed(1)}MB — over the 15MB limit`);
+
+      const name = filename || decodeURIComponent(u.pathname.split("/").filter(Boolean).pop() || "") || "attachment";
+      const type = mime_type || res.headers.get("content-type")?.split(";")[0] || "application/octet-stream";
+      const out = await vkUpload(EP.attachments(task_id), { filename: name, buffer, mimeType: type });
+      return { task_id, filename: name, bytes: buffer.length, mime_type: type, source: host + u.pathname, result: out };
+    },
+  },
+  {
     name: "list_attachments",
     description: "List files attached to a task.",
     inputSchema: {
