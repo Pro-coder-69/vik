@@ -270,7 +270,7 @@ const TOOLS = [
   },
   {
     name: "create_task",
-    description: "Create a task in a project. `description` is markdown by default and is converted to HTML, which is what Vikunja renders. Pass `done: true` to create an already-completed task (importing history) — no follow-up update_task needed. The response deliberately does NOT echo the description back.",
+    description: "Create a task in a project. `description` is markdown by default and is converted to HTML, which is what Vikunja renders. Pass `done: true` to create an already-completed task (importing history) — no follow-up update_task needed. The response deliberately does NOT echo the description back. A title beginning with an imported key like \"EK-142 \" is guarded against duplicates: if that key already exists in the project, nothing is created and the existing task is returned with skipped: true.",
     inputSchema: {
       type: "object",
       properties: {
@@ -281,11 +281,37 @@ const TOOLS = [
         done: { type: "boolean", description: "Create the task already completed. Vikunja files it into the Done bucket itself." },
         due_date: { type: "string", description: "ISO timestamp" },
         priority: { type: "number", description: "0-5" },
+        unique_title: { type: "boolean", description: "Guard on the whole title, not just an imported key. Use for any task that must not be created twice." },
+        allow_duplicate: { type: "boolean", description: "Skip the guard entirely and create regardless." },
       },
       required: ["project_id", "title"],
       additionalProperties: false,
     },
-    run: async ({ project_id, title, description, description_format, done, due_date, priority }) => {
+    run: async ({ project_id, title, description, description_format, done, due_date, priority, unique_title, allow_duplicate }) => {
+      // There is no delete permission on this token, so a task created twice can
+      // only be removed by hand in the UI. A session that drops mid-batch and
+      // re-runs a ticket is the realistic way that happens, so guard by default
+      // on the imported "EK-142 " key, and on the full title when asked.
+      if (allow_duplicate !== true) {
+        const key = /^([A-Z]{2,6}-\d+)\s/.exec(title)?.[1];
+        if (key || unique_title === true) {
+          const needle = key || title;
+          const hits = (await vk(EP.projectTasks(project_id), { query: { s: needle, per_page: 50 } })) ?? [];
+          const match = hits.find((t) =>
+            key ? new RegExp(`^${key}(\\s|$)`).test(String(t.title ?? ""))
+                : String(t.title ?? "").trim() === title.trim());
+          if (match) {
+            return {
+              skipped: true,
+              reason: key
+                ? `A task with the key "${key}" already exists in project ${project_id}.`
+                : `A task titled "${title}" already exists in project ${project_id}.`,
+              existing: writeAck(match),
+              hint: "Nothing was created. Continue with the existing task, or pass allow_duplicate: true to override.",
+            };
+          }
+        }
+      }
       let task = await vk(EP.createTask(project_id), {
         method: "PUT",
         body: { title, description: mdToHtml(description, description_format), done, due_date, priority },
@@ -353,19 +379,20 @@ const TOOLS = [
   },
   {
     name: "attach_from_url",
-    description: "Download a file from a URL and attach it to a task. For migrating images out of another tracker: the server fetches the bytes itself, so they never pass through the conversation. Signed URLs (e.g. Linear's uploads.linear.app links) work as-is and usually expire in minutes — call this promptly after fetching the link.",
+    description: "Download a file from a URL and attach it to a task. For migrating images out of another tracker: the server fetches the bytes itself, so they never pass through the conversation. Signed URLs (e.g. Linear's uploads.linear.app links) work as-is and usually expire in minutes — call this promptly after fetching the link. Re-attaching the same filename at the same byte size is skipped rather than duplicated, so a re-run after a dropped connection is safe.",
     inputSchema: {
       type: "object",
       properties: {
         task_id: { type: "number" },
         url: { type: "string", description: "http(s) URL of the file" },
-        filename: { type: "string", description: "Override the name; defaults to the URL's last path segment" },
+        filename: { type: "string", description: "Override the name; defaults to the URL's last path segment. Pass a stable name — the duplicate check matches on it." },
         mime_type: { type: "string", description: "Override; defaults to the response Content-Type" },
+        allow_duplicate: { type: "boolean", description: "Attach even if an identical filename+size is already on the task." },
       },
       required: ["task_id", "url"],
       additionalProperties: false,
     },
-    run: async ({ task_id, url, filename, mime_type }) => {
+    run: async ({ task_id, url, filename, mime_type, allow_duplicate }) => {
       let u;
       try { u = new URL(url); } catch { throw new Error(`Not a valid URL: ${url}`); }
       if (u.protocol !== "https:" && u.protocol !== "http:") throw new Error(`Refusing protocol ${u.protocol}`);
@@ -387,6 +414,25 @@ const TOOLS = [
 
       const name = filename || decodeURIComponent(u.pathname.split("/").filter(Boolean).pop() || "") || "attachment";
       const type = mime_type || res.headers.get("content-type")?.split(";")[0] || "application/octet-stream";
+
+      // Same reasoning as create_task's guard: attachments cannot be deleted
+      // with this token, so re-running a ticket after a dropped connection
+      // would leave the same screenshot on it twice. Matched on filename AND
+      // byte size, so a genuinely different file reusing a name still uploads.
+      if (allow_duplicate !== true) {
+        const existing = (await vk(EP.attachments(task_id))) ?? [];
+        const dupe = existing.find(
+          (a) => a?.file?.name === name && Number(a?.file?.size) === buffer.length);
+        if (dupe) {
+          return {
+            skipped: true,
+            reason: `"${name}" (${buffer.length} bytes) is already attached to task ${task_id}.`,
+            existing_attachment_id: dupe.id,
+            hint: "Nothing was uploaded. Pass allow_duplicate: true to attach it again anyway.",
+          };
+        }
+      }
+
       const out = await vkUpload(EP.attachments(task_id), { filename: name, buffer, mimeType: type });
       return { task_id, filename: name, bytes: buffer.length, mime_type: type, source: host + u.pathname, result: out };
     },
@@ -662,7 +708,7 @@ async function handleRpc(msg) {
       return rpcResult(id, {
         protocolVersion: params?.protocolVersion ?? "2025-06-18",
         capabilities: { tools: {} },
-        serverInfo: { name: "vikunja-mcp", version: "1.2.0" },
+        serverInfo: { name: "vikunja-mcp", version: "1.3.0" },
       });
     case "ping":
       return rpcResult(id, {});
