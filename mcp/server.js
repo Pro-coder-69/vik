@@ -95,13 +95,18 @@ async function vkUpload(path, { filename, buffer, mimeType }) {
 
 const strip = (s) => String(s ?? "").replace(/<[^>]*>/g, "").trim();
 
-function slimTask(t) {
+// descriptionChars: 0 means no limit. Only LIST calls truncate, so a listing of
+// 50 tickets doesn't return 50 full specs; single-task reads return everything.
+function slimTask(t, { descriptionChars = 0 } = {}) {
   if (!t || typeof t !== "object") return t;
+  const full = strip(t.description);
+  const cut = descriptionChars > 0 && full.length > descriptionChars;
   return {
     id: t.id,
     identifier: t.identifier,
     title: t.title,
-    description: strip(t.description).slice(0, 500),
+    ...(cut ? { description_truncated: true, description_full_chars: full.length } : {}),
+    description: cut ? full.slice(0, descriptionChars) : full,
     done: t.done,
     project_id: t.project_id,
     bucket_id: t.bucket_id,
@@ -157,12 +162,59 @@ const TOOLS = [
           order_by: "desc",
         },
       });
-      return (tasks ?? []).map(slimTask);
+      // Listings preview the description; get_task returns it whole.
+      return (tasks ?? []).map((t) => slimTask(t, { descriptionChars: 500 }));
+    },
+  },
+  {
+    name: "edit_description",
+    description: "Replace an exact substring inside a task's description, without sending the whole description. Use this to fix or remove a line when you cannot see the full text — get_task truncates to 500 characters, and update_task replaces the description wholesale, so editing blind with update_task destroys content.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        task_id: { type: "number" },
+        old_str: { type: "string", description: "Exact text to replace. Must appear exactly once unless replace_all is set." },
+        new_str: { type: "string", description: "Replacement text. Empty string deletes it." },
+        replace_all: { type: "boolean", description: "Replace every occurrence instead of requiring exactly one" },
+      },
+      required: ["task_id", "old_str", "new_str"],
+      additionalProperties: false,
+    },
+    // The whole point is that the caller never has to hold the full description,
+    // so the match and the write both happen here against the stored HTML.
+    run: async ({ task_id, old_str, new_str, replace_all }) => {
+      const current = await vk(EP.task(task_id));
+      const before = String(current.description ?? "");
+      const count = old_str ? before.split(old_str).length - 1 : 0;
+      if (count === 0) {
+        throw new Error(`Not found in task ${task_id}'s description. Remember it is stored as HTML, so match the rendered markup (e.g. "<p>text</p>"), not the markdown you wrote. Use get_description to see the raw text.`);
+      }
+      if (count > 1 && !replace_all) {
+        throw new Error(`"${old_str.slice(0, 40)}..." appears ${count} times; pass replace_all:true or give a longer, unique string.`);
+      }
+      const after = replace_all ? before.split(old_str).join(new_str) : before.replace(old_str, new_str);
+      await vk(EP.task(task_id), { method: "POST", body: { ...current, description: after } });
+      return { task_id, replaced: replace_all ? count : 1, chars_before: before.length, chars_after: after.length };
+    },
+  },
+  {
+    name: "get_description",
+    description: "Fetch a task's description in full and untruncated, as stored (HTML). get_task returns it stripped of tags; use this when you need the exact markup — before rewriting it, or to find the exact string to pass to edit_description.",
+    inputSchema: {
+      type: "object",
+      properties: { task_id: { type: "number" } },
+      required: ["task_id"],
+      additionalProperties: false,
+    },
+    run: async ({ task_id }) => {
+      const t = await vk(EP.task(task_id));
+      const description = String(t.description ?? "");
+      return { task_id, title: t.title, chars: description.length, description };
     },
   },
   {
     name: "get_task",
-    description: "Fetch one task in full, including comments.",
+    description: "Fetch one task with its description and comments in FULL — nothing truncated. Use this to read a whole ticket. (list_tasks previews descriptions at 500 chars and flags them with description_truncated.)",
     inputSchema: {
       type: "object",
       properties: { task_id: { type: "number" } },
@@ -174,7 +226,7 @@ const TOOLS = [
       let comments = [];
       try {
         comments = (await vk(EP.comments(task_id)) ?? []).map((c) => ({
-          author: c.author?.username, created: c.created, comment: strip(c.comment).slice(0, 1000),
+          author: c.author?.username, created: c.created, comment: strip(c.comment),
         }));
       } catch { /* comments optional; don't fail the read */ }
       return { ...slimTask(task), comments };
