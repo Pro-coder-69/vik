@@ -293,16 +293,49 @@ function tokenOk(header) {
   return d === 0;
 }
 
+const CORS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, GET, DELETE, OPTIONS",
+  "Access-Control-Allow-Headers": "Authorization, Content-Type, Accept, Mcp-Session-Id, MCP-Protocol-Version",
+};
+
 const server = http.createServer((req, res) => {
+  const log = (status, note) =>
+    console.error(
+      `${new Date().toISOString()} ${req.method} ${req.url} -> ${status}` +
+      ` auth=${req.headers.authorization ? "present" : "absent"}` +
+      ` accept=${req.headers.accept ?? "-"}${note ? ` (${note})` : ""}`
+    );
+
   if (req.method === "GET" && req.url === "/healthz") {
+    log(200);
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({ ok: true }));
   }
-  if (req.method !== "POST" || !req.url.startsWith("/mcp")) {
+
+  const isMcp = req.url.startsWith("/mcp");
+
+  // Preflight — answer before the auth check, it carries no credentials.
+  if (req.method === "OPTIONS" && isMcp) {
+    log(204, "preflight");
+    res.writeHead(204, CORS); return res.end();
+  }
+
+  // We serve JSON responses only, no server-initiated SSE stream. The spec
+  // requires 405 (not 404) here so the client knows the endpoint exists.
+  if (isMcp && (req.method === "GET" || req.method === "DELETE")) {
+    log(405, "no SSE stream offered");
+    res.writeHead(405, { Allow: "POST, OPTIONS", "Content-Type": "application/json", ...CORS });
+    return res.end(JSON.stringify(rpcError(null, -32000, "Method Not Allowed: POST JSON-RPC to this endpoint.")));
+  }
+
+  if (req.method !== "POST" || !isMcp) {
+    log(404);
     res.writeHead(404); return res.end();
   }
   if (!tokenOk(req.headers.authorization)) {
-    res.writeHead(401, { "Content-Type": "application/json" });
+    log(401, "token mismatch");
+    res.writeHead(401, { "Content-Type": "application/json", ...CORS });
     return res.end(JSON.stringify({ error: "unauthorized" }));
   }
   let body = "";
@@ -318,16 +351,19 @@ const server = http.createServer((req, res) => {
 
     // Notifications (no id) get 202 with no body, per spec.
     const batch = Array.isArray(msg) ? msg : [msg];
+    const methods = batch.map((m) => m?.method ?? "?").join(",");
     const needsReply = batch.filter((m) => m && m.id !== undefined && m.id !== null);
-    if (needsReply.length === 0) { res.writeHead(202); return res.end(); }
+    if (needsReply.length === 0) { log(202, `notification ${methods}`); res.writeHead(202, CORS); return res.end(); }
 
     try {
       const out = await Promise.all(needsReply.map(handleRpc));
-      res.writeHead(200, { "Content-Type": "application/json" });
+      log(200, methods);
+      res.writeHead(200, { "Content-Type": "application/json", ...CORS });
       res.end(JSON.stringify(Array.isArray(msg) ? out : out[0]));
     } catch (e) {
       console.error("rpc failure:", e);
-      res.writeHead(500, { "Content-Type": "application/json" });
+      log(500, methods);
+      res.writeHead(500, { "Content-Type": "application/json", ...CORS });
       res.end(JSON.stringify(rpcError(null, -32603, "Internal error")));
     }
   });
