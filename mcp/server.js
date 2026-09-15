@@ -60,7 +60,20 @@ const EP = {
   // bucket_id entirely, so this is the only way to read board position.
   viewTasks: (pid, vid) => `/api/v1/projects/${pid}/views/${vid}/tasks`,
   bucketTasks: (pid, vid, bid) => `/api/v1/projects/${pid}/views/${vid}/buckets/${bid}/tasks`,
+  labels: () => `/api/v1/labels`,
+  taskLabels: (tid) => `/api/v1/tasks/${tid}/labels`,
+  taskLabel: (tid, lid) => `/api/v1/tasks/${tid}/labels/${lid}`,
+  // Relations are the only way to restore sub-issue links; kinds are
+  // subtask/parenttask/related/duplicates/blocking/blocked/precedes/follows/
+  // copiedfrom/copiedto. Needs the token's "Tasks Relations" route group.
+  relations: (tid) => `/api/v1/tasks/${tid}/relations`,
+  allTasks: () => `/api/v1/tasks`,
 };
+
+const RELATION_KINDS = [
+  "subtask", "parenttask", "related", "duplicateof", "duplicates",
+  "blocking", "blocked", "precedes", "follows", "copiedfrom", "copiedto",
+];
 
 async function vk(path, { method = "GET", body, query } = {}) {
   const url = new URL(VIKUNJA_URL + path);
@@ -191,7 +204,7 @@ const TOOLS = [
   },
   {
     name: "edit_description",
-    description: "Replace an exact substring inside a task's description, without sending the whole description. Use this to fix or remove a line when you cannot see the full text — get_task truncates to 500 characters, and update_task replaces the description wholesale, so editing blind with update_task destroys content.",
+    description: "Replace an exact substring inside a task's description, without sending the whole description back. Prefer this over update_task for any small change: update_task replaces the description wholesale, so a partial rewrite destroys the rest. Descriptions are stored as HTML — match the markup, using get_description to see it.",
     inputSchema: {
       type: "object",
       properties: {
@@ -472,16 +485,134 @@ const TOOLS = [
   },
   {
     name: "add_comment",
-    description: "Add a comment to a task.",
+    description: "Add a comment to a task. `comment` is markdown by default and is converted to HTML, the same as task descriptions — pass comment_format: \"html\" to opt out. (Before this, comments were sent raw and markdown rendered literally.)",
     inputSchema: {
       type: "object",
-      properties: { task_id: { type: "number" }, comment: { type: "string" } },
+      properties: {
+        task_id: { type: "number" },
+        comment: { type: "string" },
+        comment_format: { type: "string", enum: ["markdown", "html"], description: "Default markdown" },
+      },
       required: ["task_id", "comment"],
       additionalProperties: false,
     },
-    run: async ({ task_id, comment }) => {
-      const c = await vk(EP.comments(task_id), { method: "PUT", body: { comment } });
+    run: async ({ task_id, comment, comment_format }) => {
+      const c = await vk(EP.comments(task_id), {
+        method: "PUT",
+        body: { comment: mdToHtml(comment, comment_format) },
+      });
       return { id: c?.id, task_id, created: c?.created };
+    },
+  },
+  {
+    name: "list_labels",
+    description: "All labels that exist on the instance, with their ids. Labels are instance-wide in Vikunja, not per-project.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    run: async () => {
+      const raw = (await vk(EP.labels())) ?? [];
+      return { labels: raw.map((l) => ({ id: l.id, title: l.title, hex_color: l.hex_color })) };
+    },
+  },
+  {
+    name: "set_labels",
+    description: "Attach labels to a task by title, creating any that do not exist yet. Titles are matched case-insensitively so \"bug\" and \"Bug\" do not become two labels. Additive by default: pass replace: true to remove labels the task has that are not in the list.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        task_id: { type: "number" },
+        labels: { type: "array", items: { type: "string" }, description: "Label titles, e.g. [\"Bug\"]" },
+        replace: { type: "boolean", description: "Remove labels not in the list (default false)" },
+      },
+      required: ["task_id", "labels"],
+      additionalProperties: false,
+    },
+    run: async ({ task_id, labels, replace }) => {
+      const wanted = [...new Set(labels.map((s) => String(s).trim()).filter(Boolean))];
+      const existing = (await vk(EP.labels())) ?? [];
+      const byTitle = new Map(existing.map((l) => [String(l.title).toLowerCase(), l]));
+      const current = (await vk(EP.taskLabels(task_id))) ?? [];
+      const currentIds = new Set(current.map((l) => l.id));
+
+      const added = [], created = [], already = [];
+      for (const title of wanted) {
+        let label = byTitle.get(title.toLowerCase());
+        if (!label) {
+          label = await vk(EP.labels(), { method: "PUT", body: { title } });
+          byTitle.set(title.toLowerCase(), label);
+          created.push(label.title);
+        }
+        if (currentIds.has(label.id)) { already.push(label.title); continue; }
+        await vk(EP.taskLabels(task_id), { method: "PUT", body: { label_id: label.id } });
+        added.push(label.title);
+      }
+
+      const removed = [];
+      if (replace === true) {
+        const keep = new Set(wanted.map((t) => byTitle.get(t.toLowerCase())?.id));
+        for (const l of current) {
+          if (keep.has(l.id)) continue;
+          await vk(EP.taskLabel(task_id, l.id), { method: "DELETE" });
+          removed.push(l.title);
+        }
+      }
+      return { task_id, added, created, already, removed };
+    },
+  },
+  {
+    name: "relate_tasks",
+    description: "Link two tasks, e.g. to restore a sub-issue relationship. From the perspective of task_id: \"subtask\" makes other_task_id a child of it, \"parenttask\" makes other_task_id its parent. Vikunja writes the inverse side automatically. If this returns 401, the API token is missing the \"Tasks Relations\" route group and has to be re-minted.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        task_id: { type: "number" },
+        other_task_id: { type: "number" },
+        relation_kind: { type: "string", enum: RELATION_KINDS, description: "Default \"related\"" },
+      },
+      required: ["task_id", "other_task_id"],
+      additionalProperties: false,
+    },
+    run: async ({ task_id, other_task_id, relation_kind }) => {
+      const kind = relation_kind || "related";
+      // inputSchema enums are advisory — this server does not validate against
+      // them, so an unknown kind would otherwise be posted straight to Vikunja.
+      if (!RELATION_KINDS.includes(kind)) {
+        throw new Error(`Unknown relation_kind "${kind}". Valid kinds: ${RELATION_KINDS.join(", ")}`);
+      }
+      if (task_id === other_task_id) {
+        throw new Error(`Cannot relate task ${task_id} to itself.`);
+      }
+      await vk(EP.relations(task_id), {
+        method: "PUT",
+        body: { other_task_id, relation_kind: kind },
+      });
+      return { task_id, other_task_id, relation_kind: kind, note: "Vikunja writes the inverse relation on the other task itself." };
+    },
+  },
+  {
+    name: "search_tasks",
+    description: "Find tasks whose title or description matches a search string. Searches the whole instance unless project_id is given. Descriptions are previewed at 200 characters — call get_task for the full body.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        project_id: { type: "number", description: "Optional: restrict to one project" },
+        include_done: { type: "boolean", description: "Default true — unlike list_tasks, since search is usually for finding history" },
+        limit: { type: "number", description: "Max 50, default 25" },
+      },
+      required: ["query"],
+      additionalProperties: false,
+    },
+    run: async ({ query, project_id, include_done, limit }) => {
+      const per = Math.min(Math.max(limit ?? 25, 1), 50);
+      const q = { s: query, per_page: per };
+      if (include_done === false) q.filter = "done = false";
+      const path = project_id ? EP.projectTasks(project_id) : EP.allTasks();
+      const raw = (await vk(path, { query: q })) ?? [];
+      return {
+        query,
+        count: raw.length,
+        tasks: raw.map((t) => slimTask(t, { descriptionChars: 200 })),
+      };
     },
   },
   {
@@ -531,7 +662,7 @@ async function handleRpc(msg) {
       return rpcResult(id, {
         protocolVersion: params?.protocolVersion ?? "2025-06-18",
         capabilities: { tools: {} },
-        serverInfo: { name: "vikunja-mcp", version: "1.1.0" },
+        serverInfo: { name: "vikunja-mcp", version: "1.2.0" },
       });
     case "ping":
       return rpcResult(id, {});
