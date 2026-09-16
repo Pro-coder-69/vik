@@ -156,7 +156,13 @@ MCP_PRINCIPALS="alice:<her bridge token>:<her vikunja token>; bob:<his>:<his>"
 
 Semicolons separate people, colons separate the three fields. `MCP_AUTH_TOKEN` and
 `VIKUNJA_TOKEN` stay as the `owner` principal, so an existing deployment keeps working
-untouched. Redeploy with a rebuild, since the bridge is built from source.
+untouched. Then **recreate the container** — environment changes only take effect when the
+container is recreated, not when a stack is merely updated in place. In Portainer that is
+**Pull and redeploy**; over SSH it is `docker compose up -d --force-recreate vikunja-mcp`.
+
+If you deploy over SSH, note that Compose reads the `.env` file next to `docker-compose.yml`
+— it does not see variables set in Portainer's UI, and vice versa. Setting the value in one
+place and deploying from the other is the most common way this silently does nothing.
 
 ### 6. Verify
 
@@ -202,6 +208,8 @@ Check the bridge logs first (`docker logs <vikunja-mcp container>` or Portainer 
 | `401 auth=absent` | No auth header arrived. Check the connector header or whether the proxy strips it. |
 | Nothing logged | The request never reached the bridge. Check DNS and the reverse proxy. |
 | Buckets return 401, tasks work | The API token is missing the **Projects Views** permission. |
+| Startup shows fewer names in `principals=` than you configured | `MCP_PRINCIPALS` never reached the container. The container was not recreated, or the value was set in Portainer while you deployed over SSH (or the reverse). Check with `docker inspect <container> --format '{{range .Config.Env}}{{println .}}{{end}}' \| cut -d= -f1` — keys only, no secrets. |
+| A user is shared on a project but cannot edit | Sharing defaults to **Read only**. Raise it to Can write. |
 
 ## Author
 
