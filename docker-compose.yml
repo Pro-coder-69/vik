@@ -42,6 +42,12 @@ services:
       VIKUNJA_URL: "http://vikunja:3456"
       VIKUNJA_TOKEN: "${VIKUNJA_API_TOKEN}"
       MCP_AUTH_TOKEN: "${MCP_AUTH_TOKEN}"
+      # Extra people, each acting as themselves in Vikunja. Optional; the pair
+      # above is the "owner" principal and works on its own.
+      #   MCP_PRINCIPALS="name:<mcp auth token>:<vikunja api token>; name2:..."
+      # Use hex-only tokens: Compose mangles dollar signs, and ":" and ";"
+      # are the field and record delimiters.
+      MCP_PRINCIPALS: "${MCP_PRINCIPALS:-}"
       MCP_PORT: "8790"
       MCP_BLOCK_DONE: "true"
       MCP_DONE_BUCKET_TITLE: "Done"
