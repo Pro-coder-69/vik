@@ -141,6 +141,18 @@ const EP = {
   // copiedfrom/copiedto. Needs the token's "Tasks Relations" route group.
   relations: (tid) => `/api/v1/tasks/${tid}/relations`,
   allTasks: () => `/api/v1/tasks`,
+  // Everyone assignable on a project: the OWNER plus everyone it is shared
+  // with. /projects/:id/users looks like the same thing and is not — it lists
+  // shares only, so the owner is missing and cannot be assigned to their own
+  // tickets. This one lives on the "Projects" token route group, not
+  // "Projects Users".
+  projectUsers: (pid) => `/api/v1/projects/${pid}/projectusers`,
+  taskAssignees: (tid) => `/api/v1/tasks/${tid}/assignees`,
+  // Sets the assignee list to exactly what is posted: anyone left out is
+  // unassigned, and [] clears the task. That is why nothing here needs DELETE
+  // on the token — removal goes through this endpoint, not
+  // DELETE /tasks/:id/assignees/:user.
+  taskAssigneesBulk: (tid) => `/api/v1/tasks/${tid}/assignees/bulk`,
 };
 
 const RELATION_KINDS = [
@@ -261,6 +273,57 @@ async function kanbanView(projectId) {
   return v;
 }
 
+// Assignee writes take numeric user ids, but people say usernames. Resolving
+// against the project's own member list doubles as the access check: Vikunja
+// refuses to assign someone without access to the project, and a name that is
+// not in this list is exactly that case, so it fails here with the valid names
+// instead of as an opaque 403 from the API.
+async function resolveProjectUsers(projectId, users) {
+  const members = (await vk(EP.projectUsers(projectId))) ?? [];
+  const byId = new Map(members.map((u) => [u.id, u]));
+  const byName = new Map(members.map((u) => [String(u.username).toLowerCase(), u]));
+  const picked = [], unknown = [];
+  for (const raw of users) {
+    const hit = typeof raw === "number"
+      ? byId.get(raw)
+      : byName.get(String(raw).trim().toLowerCase());
+    if (!hit) { unknown.push(String(raw)); continue; }
+    if (!picked.some((u) => u.id === hit.id)) picked.push(hit);
+  }
+  if (unknown.length) {
+    const valid = members.map((u) => u.username).join(", ") || "(nobody)";
+    throw new Error(
+      `Not assignable on project ${projectId}: ${unknown.join(", ")}. ` +
+      `Either the username is wrong or the project is not shared with them. Assignable: ${valid}`
+    );
+  }
+  return picked;
+}
+
+// models.BulkAssignees wants user objects, not bare ids.
+const asAssignees = (users) => users.map((u) => ({ id: u.id, username: u.username }));
+
+// The bulk endpoint is documented to unassign anyone left out of the list, and
+// that claim is load-bearing: it is the only reason removal works without a
+// delete permission on the token. So the result is read back and reported,
+// rather than the caller being told what was intended. If Vikunja ever stops
+// honouring it, every caller sees drift: true instead of a quiet wrong answer.
+async function bulkSetAssignees(taskId, users) {
+  await vk(EP.taskAssigneesBulk(taskId), { method: "POST", body: { assignees: asAssignees(users) } });
+  const after = (await vk(EP.taskAssignees(taskId))) ?? [];
+  const actual = after.map((u) => u.username);
+  const intended = users.map((u) => u.username);
+  const drift = actual.length !== intended.length || intended.some((n) => !actual.includes(n));
+  return {
+    assignees: actual,
+    ...(drift ? {
+      drift: true,
+      intended,
+      warning: "Vikunja did not apply the assignee list as sent. Removal via the bulk endpoint may not be supported on this version — report this rather than enabling a delete permission to work around it.",
+    } : {}),
+  };
+}
+
 /* ------------------------------ tools ------------------------------ */
 const TOOLS = [
   {
@@ -271,24 +334,27 @@ const TOOLS = [
   },
   {
     name: "list_tasks",
-    description: "List tasks in a project. Use updated_since to see only recent changes.",
+    description: "List tasks in a project. Use updated_since to see only recent changes, or assignee to see one person's work.",
     inputSchema: {
       type: "object",
       properties: {
         project_id: { type: "number", description: "Project id from list_projects" },
         include_done: { type: "boolean", description: "Include completed tasks (default false)" },
         updated_since: { type: "string", description: "ISO timestamp, e.g. 2026-09-14T00:00:00Z" },
+        assignee: { type: "string", description: "Username, from list_project_users. Read assignee_filter in the response before trusting the page count." },
         limit: { type: "number", description: `Max ${MAX_PAGE}` },
         page: { type: "number", description: "1-based page number" },
       },
       required: ["project_id"],
       additionalProperties: false,
     },
-    run: async ({ project_id, include_done = false, updated_since, limit = MAX_PAGE, page = 1 }) => {
+    run: async ({ project_id, include_done = false, updated_since, assignee, limit = MAX_PAGE, page = 1 }) => {
       const f = [];
       if (!include_done) f.push("done = false");
       if (updated_since) f.push(`updated > '${updated_since}'`);
-      const tasks = await vk(EP.projectTasks(project_id), {
+      const who = assignee ? String(assignee).trim().toLowerCase() : null;
+      if (who) f.push(`assignees in '${who}'`);
+      const tasks = (await vk(EP.projectTasks(project_id), {
         query: {
           filter: f.length ? f.join(" && ") : undefined,
           per_page: Math.min(limit, MAX_PAGE),
@@ -296,9 +362,25 @@ const TOOLS = [
           sort_by: "updated",
           order_by: "desc",
         },
-      });
+      })) ?? [];
       // Listings preview the description; get_task returns it whole.
-      return (tasks ?? []).map((t) => slimTask(t, { descriptionChars: 500 }));
+      const slim = tasks.map((t) => slimTask(t, { descriptionChars: 500 }));
+      if (!who) return slim;
+      // Verify the server honoured the assignee filter rather than assuming it.
+      // If any row comes back without that assignee, the filter was ignored and
+      // this page is really an unfiltered page, so it is narrowed here and the
+      // caller is told the count and paging cannot be trusted as a total.
+      const matches = (t) => (t.assignees ?? []).some((u) => String(u).toLowerCase() === who);
+      const kept = slim.filter(matches);
+      const honoured = kept.length === slim.length;
+      return {
+        assignee: who,
+        assignee_filter: honoured
+          ? "server-side"
+          : "client-side — Vikunja ignored the filter, so this is page " + page + " of the UNFILTERED list narrowed here; later pages may hold more",
+        count: kept.length,
+        tasks: kept,
+      };
     },
   },
   {
@@ -750,6 +832,124 @@ const TOOLS = [
     },
   },
   {
+    name: "list_project_users",
+    description: "Everyone who can be assigned on a project: the owner plus everyone it is shared with, as id + username. Call this before assign_task when you are unsure of a username — assignment takes numeric user ids, and a person who is not on this list cannot be assigned at all until the project is shared with them.",
+    inputSchema: {
+      type: "object",
+      properties: { project_id: { type: "number" } },
+      required: ["project_id"],
+      additionalProperties: false,
+    },
+    run: async ({ project_id }) => {
+      const raw = (await vk(EP.projectUsers(project_id))) ?? [];
+      return {
+        project_id,
+        count: raw.length,
+        users: raw.map((u) => ({ id: u.id, username: u.username, name: u.name || null })),
+      };
+    },
+  },
+  {
+    name: "assign_task",
+    description: "Put people on a task. Accepts usernames or numeric ids, mixed. Additive by default: mode \"replace\" makes the assignee list exactly the people given, dropping anyone else. Idempotent — assigning someone already on the task is a no-op, not an error — so it is safe to re-run over a batch to repair it. An unknown username fails with the list of assignable people rather than a bare API error. If this returns 401, the token is missing the \"Tasks Assignees\" route group and has to be re-minted.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        task_id: { type: "number" },
+        users: {
+          type: "array",
+          items: { type: ["string", "number"] },
+          description: "Usernames or user ids, e.g. [\"eliabe\"]",
+        },
+        mode: { type: "string", enum: ["add", "replace"], description: "Default \"add\"" },
+      },
+      required: ["task_id", "users"],
+      additionalProperties: false,
+    },
+    run: async ({ task_id, users, mode }) => {
+      const m = mode ?? "add";
+      if (m !== "add" && m !== "replace") throw new Error(`Unknown mode "${m}". Use "add" or "replace".`);
+      if (!Array.isArray(users) || users.length === 0) {
+        throw new Error(`users is empty. To clear a task's assignees use unassign_task, or assign_task with mode "replace" and the people who should remain.`);
+      }
+      const task = await vk(EP.task(task_id));
+      const current = task?.assignees ?? [];
+      const wanted = await resolveProjectUsers(task?.project_id, users);
+
+      const currentIds = new Set(current.map((u) => u.id));
+      const already = wanted.filter((u) => currentIds.has(u.id)).map((u) => u.username);
+      const added = wanted.filter((u) => !currentIds.has(u.id)).map((u) => u.username);
+
+      const final = m === "replace"
+        ? wanted
+        : [...current, ...wanted.filter((u) => !currentIds.has(u.id))];
+      const finalIds = new Set(final.map((u) => u.id));
+      const removed = m === "replace"
+        ? current.filter((u) => !finalIds.has(u.id)).map((u) => u.username)
+        : [];
+
+      // Nothing to do: skip the write rather than churn the task's updated time.
+      if (!added.length && !removed.length) {
+        return { task_id, added: [], removed: [], already, assignees: current.map((u) => u.username), changed: false };
+      }
+      const result = await bulkSetAssignees(task_id, final);
+      return { task_id, added, removed, already, changed: true, ...result };
+    },
+  },
+  {
+    name: "unassign_task",
+    description: "Take people off a task, by username or id. Pass all: true to clear it completely. Someone who is not currently assigned is reported back, not treated as an error. This is implemented by re-setting the assignee list to whoever remains, so it needs no delete permission on the API token.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        task_id: { type: "number" },
+        users: {
+          type: "array",
+          items: { type: ["string", "number"] },
+          description: "Usernames or user ids. Omit when passing all: true.",
+        },
+        all: { type: "boolean", description: "Remove every assignee (default false)" },
+      },
+      required: ["task_id"],
+      additionalProperties: false,
+    },
+    run: async ({ task_id, users, all }) => {
+      const clearAll = all === true;
+      if (!clearAll && (!Array.isArray(users) || users.length === 0)) {
+        throw new Error(`Nothing to remove: pass users, or all: true to clear every assignee.`);
+      }
+      const task = await vk(EP.task(task_id));
+      const current = task?.assignees ?? [];
+      if (current.length === 0) {
+        return { task_id, removed: [], not_assigned: clearAll ? [] : users.map(String), assignees: [], changed: false };
+      }
+
+      // Matched against who is ON the task, not the project's member list: a
+      // person can be un-shared from a project while still assigned, and they
+      // still have to be removable.
+      const wanted = clearAll ? null : users.map((u) => (typeof u === "number" ? u : String(u).trim().toLowerCase()));
+      const hit = (u) => clearAll || wanted.includes(u.id) || wanted.includes(String(u.username).toLowerCase());
+      const removed = current.filter(hit);
+      const keep = current.filter((u) => !hit(u));
+
+      const matchedNames = new Set(removed.flatMap((u) => [String(u.id), String(u.username).toLowerCase()]));
+      const notAssigned = clearAll ? [] : users.map(String).filter((u) => !matchedNames.has(u.trim().toLowerCase()));
+
+      if (!removed.length) {
+        return { task_id, removed: [], not_assigned: notAssigned, assignees: current.map((u) => u.username), changed: false };
+      }
+      // [] is legal and clears the task.
+      const result = await bulkSetAssignees(task_id, keep);
+      return {
+        task_id,
+        removed: removed.map((u) => u.username),
+        not_assigned: notAssigned,
+        changed: true,
+        ...result,
+      };
+    },
+  },
+  {
     name: "search_tasks",
     description: "Find tasks whose title or description matches a search string. Searches the whole instance unless project_id is given. Descriptions are previewed at 200 characters — call get_task for the full body.",
     inputSchema: {
@@ -824,7 +1024,7 @@ async function handleRpc(msg) {
       return rpcResult(id, {
         protocolVersion: params?.protocolVersion ?? "2025-06-18",
         capabilities: { tools: {} },
-        serverInfo: { name: "vikunja-mcp", version: "1.4.0" },
+        serverInfo: { name: "vikunja-mcp", version: "1.5.0" },
       });
     case "ping":
       return rpcResult(id, {});
