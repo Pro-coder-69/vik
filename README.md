@@ -64,7 +64,7 @@ Letting an AI write to a production tracker needs guardrails. The main ones:
 | `VIKUNJA_PORT` | Host port for Vikunja |
 | `VIKUNJA_API_TOKEN` | Vikunja API token the bridge uses (create it in Vikunja → Settings → API Tokens) |
 | `MCP_AUTH_TOKEN` | Bearer token clients must send to the bridge |
-| `MCP_PRINCIPALS` | *(optional)* Additional users, each with their own Vikunja identity — see [Multiple users](#multiple-users) |
+| `MCP_PRINCIPALS` | *(optional)* Additional users, each with their own Vikunja identity — see [Adding a user](#adding-a-user) |
 | `MCP_PORT_HOST` | Host port for the bridge |
 | `TZ` | Timezone, e.g. `America/Chicago` |
 
@@ -106,17 +106,79 @@ In Claude, add a **custom connector**:
 
 Then ask Claude to run `check_api`. After adding new tools to the server, start a new chat so the client loads the updated tool list.
 
-## Multiple users
+## Adding a user
 
-One bridge can serve several people, each acting as themselves in Vikunja instead of sharing a single identity. The Vikunja API token lives in the bridge's environment rather than in the client, so a second person pointed at the same connector would otherwise act as the first. `MCP_PRINCIPALS` fixes that without a second container or subdomain:
+One bridge can serve several people, each acting as themselves in Vikunja instead of
+sharing a single identity. The Vikunja API token lives in the **bridge's environment**,
+not in the client — the client only carries `MCP_AUTH_TOKEN`. So a second person pointed
+at the same connector with the same bearer token would act as the first: indistinguishable
+in the logs, and impossible to revoke without rotating the original user's access.
+`MCP_PRINCIPALS` solves that without a second container, port, subdomain or DNS record.
+
+### 1. Create their Vikunja account
+
+Registration is disabled, so accounts are made from inside the container:
+
+```sh
+vikunja user --help                      # confirm subcommands for your version first
+vikunja user create -u <username> -e <their email>
+```
+
+Choose and send them the password out of band, and have them change it on first login.
+
+### 2. Share the project
+
+Project → **Share** → add the user with **Can write** or **Read only**. There is no
+org-wide default: without this they see nothing.
+
+### 3. They mint their own Vikunja API token
+
+Have *them* do this while logged in as themselves — that is what makes the identity real.
+Settings → **API Tokens** → Create. Grant read and write on Projects, Projects Views,
+Tasks, Task Comments, Task Attachments, Task Labels, Task Relations and Labels.
+
+**Leave every Delete permission unchecked.** Vikunja shows the value once; note the expiry.
+
+### 4. Generate their bridge token
+
+```sh
+openssl rand -hex 32
+```
+
+Hex only — Compose interprets dollar signs in values, and `:` and `;` are the
+`MCP_PRINCIPALS` delimiters.
+
+### 5. Add the principal and redeploy
 
 ```
-MCP_PRINCIPALS="alice:<her mcp token>:<her vikunja token>; bob:<his mcp token>:<his vikunja token>"
+MCP_PRINCIPALS="alice:<her bridge token>:<her vikunja token>; bob:<his>:<his>"
 ```
 
-Semicolons separate people, colons separate the three fields. `MCP_AUTH_TOKEN` and `VIKUNJA_TOKEN` stay as the `owner` principal, so an existing deployment keeps working untouched.
+Semicolons separate people, colons separate the three fields. `MCP_AUTH_TOKEN` and
+`VIKUNJA_TOKEN` stay as the `owner` principal, so an existing deployment keeps working
+untouched. Redeploy with a rebuild, since the bridge is built from source.
 
-Everyone gets their own Vikunja account and their own scoped API token, so permissions are genuinely per-user and the audit trail is honest. Removing someone means deleting their entry and redeploying, with no effect on anyone else. `check_api` reports which principal a call resolved to, and every log line carries `as=<name>`.
+### 6. Verify
+
+Startup logs the configured principals by **name only, never tokens**:
+
+```
+vikunja-mcp on :8790 -> http://vikunja:3456 (block_done=true) principals=owner,alice
+```
+
+Every request line then carries `as=<name>`, and `check_api` reports `acting_as`.
+
+### 7. What to send them
+
+Their Vikunja login, the bridge URL, and **their own** bridge token from step 4 — never
+the owner's. Connector setup: **No sign-in**, plus a request header `authorization` with
+value `Bearer <their bridge token>`.
+
+### Revoking someone
+
+Delete their entry from `MCP_PRINCIPALS` and redeploy; that cuts bridge access immediately
+and affects nobody else. Then revoke their Vikunja API token and remove them from the
+project share.
 
 ## Bridge configuration
 
