@@ -7,6 +7,7 @@
  */
 
 import http from "node:http";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { marked } from "marked";
 
 /* ------------------------- markdown -> HTML ------------------------- */
@@ -39,8 +40,80 @@ const BLOCK_DONE = (process.env.MCP_BLOCK_DONE ?? "true") === "true";
 const DONE_TITLE = (process.env.MCP_DONE_BUCKET_TITLE ?? "Done").toLowerCase();
 const MAX_PAGE = 50; // Vikunja reports max_items_per_page: 50
 
-for (const [k, v] of [["VIKUNJA_TOKEN", VIKUNJA_TOKEN], ["MCP_AUTH_TOKEN", MCP_AUTH_TOKEN]]) {
-  if (!v) { console.error(`${k} is required`); process.exit(1); }
+/* --------------------------- principals ---------------------------- */
+// One bridge, several people. A principal pairs the MCP bearer token a caller
+// presents with the Vikunja API token used for their requests, so each person
+// acts as THEMSELVES in Vikunja: separate permissions, honest audit trail, and
+// revocation by deleting one entry instead of rotating everyone's access.
+//
+// MCP_AUTH_TOKEN + VIKUNJA_TOKEN stay as the "owner" principal so an existing
+// deployment keeps working untouched. Extra people go in MCP_PRINCIPALS:
+//
+//   MCP_PRINCIPALS="eliabe:<mcp auth token>:<vikunja api token>; kim:...:..."
+//
+// Semicolons separate people, colons separate the three fields. Use hex-only
+// tokens: Docker Compose eats "$" in env values, and ":" / ";" would break the
+// parse. Adding or removing someone is an env-var edit plus a redeploy — no
+// code change, no second container, no second subdomain.
+function parsePrincipals() {
+  const out = [];
+  if (MCP_AUTH_TOKEN && VIKUNJA_TOKEN) {
+    out.push({ name: "owner", auth: MCP_AUTH_TOKEN, vikunja: VIKUNJA_TOKEN });
+  }
+  const raw = (process.env.MCP_PRINCIPALS ?? "").trim();
+  if (raw) {
+    for (const chunk of raw.split(";")) {
+      const entry = chunk.trim();
+      if (!entry) continue;
+      const parts = entry.split(":").map((s) => s.trim());
+      // Report the two failure modes separately: "3 fields" would be confusing
+      // for "dev::v1", which splits into three but leaves one blank.
+      if (parts.length !== 3) {
+        console.error(`MCP_PRINCIPALS: expected name:mcpToken:vikunjaToken (3 fields), found ${parts.length} in entry starting "${entry.slice(0, 16)}"`);
+        process.exit(1);
+      }
+      if (parts.some((p) => !p)) {
+        const blank = ["name", "mcpToken", "vikunjaToken"].filter((_, i) => !parts[i]).join(", ");
+        console.error(`MCP_PRINCIPALS: blank ${blank} in entry starting "${entry.slice(0, 16)}"`);
+        process.exit(1);
+      }
+      const [name, auth, vikunja] = parts;
+      if (!/^[A-Za-z0-9_-]+$/.test(name)) {
+        console.error(`MCP_PRINCIPALS: bad principal name "${name}" (letters, digits, _ and - only)`);
+        process.exit(1);
+      }
+      out.push({ name, auth, vikunja });
+    }
+  }
+  if (out.length === 0) {
+    console.error("No principals configured: set MCP_AUTH_TOKEN + VIKUNJA_TOKEN, or MCP_PRINCIPALS");
+    process.exit(1);
+  }
+  // Two principals sharing an MCP token would make identity depend on match
+  // order, which is exactly the ambiguity this whole mechanism exists to remove.
+  for (const key of ["name", "auth"]) {
+    const seen = new Set();
+    for (const p of out) {
+      if (seen.has(p[key])) {
+        console.error(`MCP_PRINCIPALS: duplicate ${key === "auth" ? "MCP auth token" : "principal name"}`);
+        process.exit(1);
+      }
+      seen.add(p[key]);
+    }
+  }
+  return out;
+}
+
+const PRINCIPALS = parsePrincipals();
+
+// Carries the calling principal down to vk()/vkUpload() without threading an
+// argument through every tool. Tools stay unaware that multi-tenancy exists.
+const callerCtx = new AsyncLocalStorage();
+
+function currentPrincipal() {
+  const p = callerCtx.getStore();
+  if (!p) throw new Error("No caller context — a Vikunja call was made outside a request.");
+  return p;
 }
 
 /* --------------------------- Vikunja API --------------------------- */
@@ -82,7 +155,7 @@ async function vk(path, { method = "GET", body, query } = {}) {
   }
   const res = await fetch(url, {
     method,
-    headers: { Authorization: `Bearer ${VIKUNJA_TOKEN}`, "Content-Type": "application/json" },
+    headers: { Authorization: `Bearer ${currentPrincipal().vikunja}`, "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const text = await res.text();
@@ -100,7 +173,7 @@ async function vkUpload(path, { filename, buffer, mimeType }) {
   fd.append("files", new Blob([buffer], { type: mimeType || "application/octet-stream" }), filename);
   const res = await fetch(VIKUNJA_URL + path, {
     method: "PUT",
-    headers: { Authorization: `Bearer ${VIKUNJA_TOKEN}` }, // no Content-Type: fetch sets the boundary
+    headers: { Authorization: `Bearer ${currentPrincipal().vikunja}` }, // no Content-Type: fetch sets the boundary
     body: fd,
   });
   const text = await res.text();
@@ -111,12 +184,37 @@ async function vkUpload(path, { filename, buffer, mimeType }) {
 
 const strip = (s) => String(s ?? "").replace(/<[^>]*>/g, "").trim();
 
+// Vikunja returns relations on the task itself, as related_tasks: a map of
+// relation_kind -> [Task]. There is no GET on /tasks/:id/relations (that path
+// only takes PUT and DELETE), so reading the task IS the read path.
+// Flattened to id/identifier/title/done: enough to act on, cheap enough to
+// include by default. Returns null when the task has no relations at all, so
+// callers can distinguish "none" from "not asked for".
+function slimRelations(t) {
+  const map = t?.related_tasks;
+  if (!map || typeof map !== "object") return null;
+  const out = {};
+  for (const [kind, tasks] of Object.entries(map)) {
+    if (!Array.isArray(tasks) || tasks.length === 0) continue;
+    out[kind] = tasks.map((r) => ({
+      id: r?.id,
+      identifier: r?.identifier,
+      title: r?.title,
+      done: r?.done,
+    }));
+  }
+  return Object.keys(out).length ? out : null;
+}
+
 // descriptionChars: 0 means no limit. Only LIST calls truncate, so a listing of
 // 50 tickets doesn't return 50 full specs; single-task reads return everything.
-function slimTask(t, { descriptionChars = 0 } = {}) {
+// relations: only single-task reads ask for them — a 50-task listing does not
+// need every link, and Vikunja embeds whole task objects in related_tasks.
+function slimTask(t, { descriptionChars = 0, relations = false } = {}) {
   if (!t || typeof t !== "object") return t;
   const full = strip(t.description);
   const cut = descriptionChars > 0 && full.length > descriptionChars;
+  const rel = relations ? slimRelations(t) : null;
   return {
     id: t.id,
     identifier: t.identifier,
@@ -128,6 +226,7 @@ function slimTask(t, { descriptionChars = 0 } = {}) {
     bucket_id: t.bucket_id,
     labels: (t.labels ?? []).map((l) => l.title),
     assignees: (t.assignees ?? []).map((a) => a.username),
+    ...(relations ? { related_tasks: rel ?? {} } : {}),
     due_date: t.due_date && !String(t.due_date).startsWith("0001") ? t.due_date : null,
     updated: t.updated,
   };
@@ -250,7 +349,7 @@ const TOOLS = [
   },
   {
     name: "get_task",
-    description: "Fetch one task with its description and comments in FULL — nothing truncated. Use this to read a whole ticket. (list_tasks previews descriptions at 500 chars and flags them with description_truncated.)",
+    description: "Fetch one task with its description, comments and relations in FULL — nothing truncated. Use this to read a whole ticket. related_tasks is a map of relation kind to the linked tasks, and is {} when the task has no links. (list_tasks previews descriptions at 500 chars and flags them with description_truncated, and omits relations entirely.)",
     inputSchema: {
       type: "object",
       properties: { task_id: { type: "number" } },
@@ -265,7 +364,7 @@ const TOOLS = [
           author: c.author?.username, created: c.created, comment: strip(c.comment),
         }));
       } catch { /* comments optional; don't fail the read */ }
-      return { ...slimTask(task), comments };
+      return { ...slimTask(task, { relations: true }), comments };
     },
   },
   {
@@ -606,7 +705,7 @@ const TOOLS = [
   },
   {
     name: "relate_tasks",
-    description: "Link two tasks, e.g. to restore a sub-issue relationship. From the perspective of task_id: \"subtask\" makes other_task_id a child of it, \"parenttask\" makes other_task_id its parent. Vikunja writes the inverse side automatically. If this returns 401, the API token is missing the \"Tasks Relations\" route group and has to be re-minted.",
+    description: "Link two tasks, e.g. to restore a sub-issue relationship. From the perspective of task_id: \"subtask\" makes other_task_id a child of it, \"parenttask\" makes other_task_id its parent. Vikunja writes the inverse side automatically. Read existing links back with list_relations (or get_task) rather than re-creating one to see if it is there — a duplicate returns 409. If this returns 401, the API token is missing the \"Tasks Relations\" route group and has to be re-minted.",
     inputSchema: {
       type: "object",
       properties: {
@@ -632,6 +731,22 @@ const TOOLS = [
         body: { other_task_id, relation_kind: kind },
       });
       return { task_id, other_task_id, relation_kind: kind, note: "Vikunja writes the inverse relation on the other task itself." };
+    },
+  },
+  {
+    name: "list_relations",
+    description: "List the tasks linked to one task, grouped by relation kind (subtask, parenttask, related, blocking, blocked, ...). Returns {} when the task has no links. This is the read path for relations: relate_tasks writes them, this reads them back. Cheaper than get_task, which also returns the full description and every comment.",
+    inputSchema: {
+      type: "object",
+      properties: { task_id: { type: "number" } },
+      required: ["task_id"],
+      additionalProperties: false,
+    },
+    run: async ({ task_id }) => {
+      const task = await vk(EP.task(task_id));
+      const relations = slimRelations(task) ?? {};
+      const count = Object.values(relations).reduce((n, list) => n + list.length, 0);
+      return { task_id, identifier: task?.identifier, title: task?.title, relations, count };
     },
   },
   {
@@ -689,8 +804,9 @@ const TOOLS = [
       } else {
         results.push({ endpoint: "tasks/views/buckets", ok: false, error: "no project to test against" });
       }
-      return { vikunja_url: VIKUNJA_URL, block_done: BLOCK_DONE, max_page: MAX_PAGE, results,
-        note: "Writes are not probed — test create_task / move_task / add_comment by hand." };
+      return { vikunja_url: VIKUNJA_URL, acting_as: currentPrincipal().name,
+        block_done: BLOCK_DONE, max_page: MAX_PAGE, results,
+        note: "Writes are not probed — test create_task / move_task / add_comment by hand. acting_as is which Vikunja API token these calls used; permissions differ per principal." };
     },
   },
 ];
@@ -708,7 +824,7 @@ async function handleRpc(msg) {
       return rpcResult(id, {
         protocolVersion: params?.protocolVersion ?? "2025-06-18",
         capabilities: { tools: {} },
-        serverInfo: { name: "vikunja-mcp", version: "1.3.0" },
+        serverInfo: { name: "vikunja-mcp", version: "1.4.0" },
       });
     case "ping":
       return rpcResult(id, {});
@@ -731,12 +847,20 @@ async function handleRpc(msg) {
   }
 }
 
-function tokenOk(header) {
-  const p = (header ?? "").startsWith("Bearer ") ? header.slice(7) : "";
-  if (!p || p.length !== MCP_AUTH_TOKEN.length) return false;
-  let d = 0;
-  for (let i = 0; i < p.length; i++) d |= p.charCodeAt(i) ^ MCP_AUTH_TOKEN.charCodeAt(i);
-  return d === 0;
+// Returns the matching principal, or null. Every principal is compared even
+// after a match so the work done does not depend on which token was presented
+// or on how many are configured.
+function resolvePrincipal(header) {
+  const presented = (header ?? "").startsWith("Bearer ") ? header.slice(7) : "";
+  if (!presented) return null;
+  let found = null;
+  for (const p of PRINCIPALS) {
+    let d = presented.length ^ p.auth.length;
+    const n = Math.min(presented.length, p.auth.length);
+    for (let i = 0; i < n; i++) d |= presented.charCodeAt(i) ^ p.auth.charCodeAt(i);
+    if (d === 0) found = p;
+  }
+  return found;
 }
 
 const CORS = {
@@ -746,10 +870,11 @@ const CORS = {
 };
 
 const server = http.createServer((req, res) => {
+  let who = "-"; // set once the bearer token is resolved, for the log line
   const log = (status, note) =>
     console.error(
       `${new Date().toISOString()} ${req.method} ${req.url} -> ${status}` +
-      ` auth=${req.headers.authorization ? "present" : "absent"}` +
+      ` auth=${req.headers.authorization ? "present" : "absent"} as=${who}` +
       ` accept=${req.headers.accept ?? "-"}${note ? ` (${note})` : ""}`
     );
 
@@ -779,11 +904,13 @@ const server = http.createServer((req, res) => {
     log(404);
     res.writeHead(404); return res.end();
   }
-  if (!tokenOk(req.headers.authorization)) {
+  const principal = resolvePrincipal(req.headers.authorization);
+  if (!principal) {
     log(401, "token mismatch");
     res.writeHead(401, { "Content-Type": "application/json", ...CORS });
     return res.end(JSON.stringify({ error: "unauthorized" }));
   }
+  who = principal.name;
   let body = "";
   req.on("data", (c) => {
     body += c;
@@ -802,7 +929,8 @@ const server = http.createServer((req, res) => {
     if (needsReply.length === 0) { log(202, `notification ${methods}`); res.writeHead(202, CORS); return res.end(); }
 
     try {
-      const out = await Promise.all(needsReply.map(handleRpc));
+      // Everything downstream — including vk() inside a tool — runs as this caller.
+      const out = await callerCtx.run(principal, () => Promise.all(needsReply.map(handleRpc)));
       log(200, methods);
       res.writeHead(200, { "Content-Type": "application/json", ...CORS });
       res.end(JSON.stringify(Array.isArray(msg) ? out : out[0]));
@@ -816,5 +944,9 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.error(`vikunja-mcp on :${PORT} -> ${VIKUNJA_URL} (block_done=${BLOCK_DONE})`);
+  // Names only — never log a token.
+  console.error(
+    `vikunja-mcp on :${PORT} -> ${VIKUNJA_URL} (block_done=${BLOCK_DONE})` +
+    ` principals=${PRINCIPALS.map((p) => p.name).join(",")}`
+  );
 });
