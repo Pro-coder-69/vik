@@ -25,7 +25,7 @@ flowchart LR
 
 ## Tools
 
-The bridge exposes 19 tools:
+The bridge exposes 20 tools:
 
 | Area | Tools |
 |---|---|
@@ -35,7 +35,7 @@ The bridge exposes 19 tools:
 | Kanban board | `list_buckets`, `list_bucket_tasks`, `move_task` |
 | Comments | `add_comment` |
 | Labels | `list_labels`, `set_labels` (creates missing labels, case-insensitive matching) |
-| Relations | `relate_tasks` (subtask, parent, blocking, related, and more) |
+| Relations | `relate_tasks`, `list_relations` (subtask, parent, blocking, related, and more) |
 | Attachments | `attach_from_url`, `add_attachment`, `list_attachments` |
 | Diagnostics | `check_api` (self-test that reports which Vikunja endpoint is failing) |
 
@@ -49,8 +49,9 @@ Letting an AI write to a production tracker needs guardrails. The main ones:
 - **Token-efficient responses.** Write operations return a short acknowledgement instead of echoing the full description back, which cut the cost of each write roughly in half on large tickets. Listings preview descriptions and flag truncation explicitly, so a client never edits text it can only partly see.
 - **Markdown in, HTML stored.** Vikunja stores descriptions as HTML, so markdown from the client is converted with `marked` (tables, nested lists and code blocks survive).
 - **Binary data stays out of the conversation.** `attach_from_url` has the server download the file itself, so images never pass through the model as base64.
-- **Hardened auth.** Bearer tokens are compared in constant time. `GET /mcp` returns `405` (not `404`) as the MCP spec requires, so clients detect the endpoint correctly.
-- **Debuggable.** One log line per request: method, path, status, whether an auth header was present, and the JSON-RPC method.
+- **Hardened auth.** Bearer tokens are compared in constant time, against every configured principal, so the work done does not reveal which token was presented. `GET /mcp` returns `405` (not `404`) as the MCP spec requires, so clients detect the endpoint correctly.
+- **One bridge, several people.** Each caller's bearer token maps to their own Vikunja API token, so everyone acts as themselves: their own permissions, their own name in the audit trail, and revocation by deleting a single entry. Sharing one token instead would make every action look like the owner's.
+- **Debuggable.** One log line per request: method, path, status, whether an auth header was present, which principal it resolved to, and the JSON-RPC method.
 
 ## Deploy
 
@@ -63,6 +64,7 @@ Letting an AI write to a production tracker needs guardrails. The main ones:
 | `VIKUNJA_PORT` | Host port for Vikunja |
 | `VIKUNJA_API_TOKEN` | Vikunja API token the bridge uses (create it in Vikunja → Settings → API Tokens) |
 | `MCP_AUTH_TOKEN` | Bearer token clients must send to the bridge |
+| `MCP_PRINCIPALS` | *(optional)* Additional users, each with their own Vikunja identity — see [Multiple users](#multiple-users) |
 | `MCP_PORT_HOST` | Host port for the bridge |
 | `TZ` | Timezone, e.g. `America/Chicago` |
 
@@ -104,13 +106,26 @@ In Claude, add a **custom connector**:
 
 Then ask Claude to run `check_api`. After adding new tools to the server, start a new chat so the client loads the updated tool list.
 
+## Multiple users
+
+One bridge can serve several people, each acting as themselves in Vikunja instead of sharing a single identity. The Vikunja API token lives in the bridge's environment rather than in the client, so a second person pointed at the same connector would otherwise act as the first. `MCP_PRINCIPALS` fixes that without a second container or subdomain:
+
+```
+MCP_PRINCIPALS="alice:<her mcp token>:<her vikunja token>; bob:<his mcp token>:<his vikunja token>"
+```
+
+Semicolons separate people, colons separate the three fields. `MCP_AUTH_TOKEN` and `VIKUNJA_TOKEN` stay as the `owner` principal, so an existing deployment keeps working untouched.
+
+Everyone gets their own Vikunja account and their own scoped API token, so permissions are genuinely per-user and the audit trail is honest. Removing someone means deleting their entry and redeploying, with no effect on anyone else. `check_api` reports which principal a call resolved to, and every log line carries `as=<name>`.
+
 ## Bridge configuration
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `VIKUNJA_URL` | `http://vikunja:3456` | Vikunja address inside the Docker network |
 | `VIKUNJA_TOKEN` | *(required)* | API token (set from `VIKUNJA_API_TOKEN` in the compose file) |
-| `MCP_AUTH_TOKEN` | *(required)* | Bearer token for clients |
+| `MCP_AUTH_TOKEN` | *(required)* | Bearer token for clients (the `owner` principal) |
+| `MCP_PRINCIPALS` | *(empty)* | Extra principals, as `name:mcpToken:vikunjaToken` separated by `;` |
 | `MCP_PORT` | `8790` | Port the bridge listens on |
 | `MCP_BLOCK_DONE` | `true` | Refuse moves into the Done column |
 | `MCP_DONE_BUCKET_TITLE` | `Done` | Name of the column treated as Done |
