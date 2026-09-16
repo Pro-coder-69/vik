@@ -25,17 +25,18 @@ flowchart LR
 
 ## Tools
 
-The bridge exposes 20 tools:
+The bridge exposes 23 tools:
 
 | Area | Tools |
 |---|---|
 | Projects | `list_projects` |
-| Tasks | `list_tasks`, `search_tasks`, `get_task`, `create_task`, `update_task` |
+| Tasks | `list_tasks` (optionally filtered by `assignee`), `search_tasks`, `get_task`, `create_task`, `update_task` |
 | Descriptions | `get_description`, `edit_description` (exact find-and-replace done server-side) |
 | Kanban board | `list_buckets`, `list_bucket_tasks`, `move_task` |
 | Comments | `add_comment` |
 | Labels | `list_labels`, `set_labels` (creates missing labels, case-insensitive matching) |
 | Relations | `relate_tasks`, `list_relations` (subtask, parent, blocking, related, and more) |
+| Assignees | `list_project_users`, `assign_task`, `unassign_task` (add, replace or clear) |
 | Attachments | `attach_from_url`, `add_attachment`, `list_attachments` |
 | Diagnostics | `check_api` (self-test that reports which Vikunja endpoint is failing) |
 
@@ -44,6 +45,7 @@ The bridge exposes 20 tools:
 Letting an AI write to a production tracker needs guardrails. The main ones:
 
 - **Least-privilege API token.** The bridge is designed around a Vikunja token with no delete permissions on anything. Deleting stays a human action in the UI.
+- **Removal without delete rights.** Taking someone off a task looks like it needs a `DELETE` scope. Instead the bridge posts the whole assignee list to Vikunja’s bulk endpoint, which unassigns anyone left out, then reads the result back and reports `drift` if the server did not apply it. The no-delete rule survives a feature that appears to require an exception.
 - **Humans close tickets.** With `MCP_BLOCK_DONE=true`, `move_task` refuses to move anything into the Done column.
 - **Safe to re-run.** `create_task` skips duplicates by imported ticket key (or by full title with `unique_title`), and `attach_from_url` skips a file with the same name and size. A batch interrupted by a dropped connection can simply be run again.
 - **Token-efficient responses.** Write operations return a short acknowledgement instead of echoing the full description back, which cut the cost of each write roughly in half on large tickets. Listings preview descriptions and flag truncation explicitly, so a client never edits text it can only partly see.
@@ -70,7 +72,7 @@ Letting an AI write to a production tracker needs guardrails. The main ones:
 
 > **Tip:** use hex-only secrets (for example `openssl rand -hex 32`). Docker Compose interprets `$` in values, which silently changes the token inside the container.
 
-**API token permissions:** grant read and write on Projects, Projects Views, Tasks, Task Comments, Task Attachments, Task Labels, Task Relations and Labels. Leave every **Delete** permission unchecked.
+**API token permissions:** grant read and write on Projects, Projects Views, Tasks, Task Comments, Task Attachments, Task Labels, Task Relations, Task Assignees (Read All, Create and Update Bulk) and Labels, plus `projectusers` under Projects, which resolves a username to the numeric id assignment needs. Leave every **Delete** permission unchecked — removal is done by re-setting the assignee list, not by deleting.
 
 ### 2. Start the stack
 
@@ -135,7 +137,9 @@ org-wide default: without this they see nothing.
 
 Have *them* do this while logged in as themselves — that is what makes the identity real.
 Settings → **API Tokens** → Create. Grant read and write on Projects, Projects Views,
-Tasks, Task Comments, Task Attachments, Task Labels, Task Relations and Labels.
+Tasks, Task Comments, Task Attachments, Task Labels, Task Relations, Task Assignees
+(Read All, Create and Update Bulk) and Labels. Projects must also include `projectusers`,
+which is what resolves a username to the numeric id assignment needs.
 
 **Leave every Delete permission unchecked.** Vikunja shows the value once; note the expiry.
 
